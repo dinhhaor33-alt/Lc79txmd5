@@ -180,7 +180,7 @@ async function connectWS() {
             const taiPct = data.totalAmountPerType.TAI / total * 100;
             const xiuPct = 100 - taiPct;
             const streak = getStreak(history);
-            const signal = calcSignalEnhanced(taiPct, xiuPct, d.subTick, d.state, streak);
+            const signal = calcSignalEnhancedV2(taiPct, xiuPct, d.subTick, d.state, streak);
             
             if (signal.pick && (!lastPrediction || lastPrediction.id !== d.id)) {
               lastPrediction = {
@@ -202,7 +202,7 @@ async function connectWS() {
                 confidence: signal.confidence
               };
 
-              console.log(`[PRED] #${d.id}: Dự đoán ${signal.pick} (${signal.confidence.toFixed(0)}%) tại 10s`);
+              console.log(`[PRED] #${d.id}: Dự đoán ${signal.pick} (${signal.confidence.toFixed(0)}%) tại 10s (V2)`);
 
               fs.appendFile('snapshots_10s.jsonl', JSON.stringify(lastSnapshot10s) + '\n', (err) => {
                 if (err) console.error('[FILE] Lỗi lưu snapshot 10s:', err.message);
@@ -320,8 +320,8 @@ function getStreak(hist) {
   return { count, type: first };
 }
 
-// THUẬT TOÁN CŨ (giữ lại để đối chiếu)
-function calcSignal(taiPct, xiuPct, tick, state, streak) {
+// THUẬT TOÁN NÂNG CẤP V2 (tinh chỉnh dựa trên backtest 377 phiên)
+function calcSignalEnhancedV2(taiPct, xiuPct, tick, state, streak) {
   if (state !== 'BETTING' || tick > 30) {
     return { icon: '⏳', text: 'Chờ dữ liệu', confidence: 0, pick: null };
   }
@@ -329,76 +329,39 @@ function calcSignal(taiPct, xiuPct, tick, state, streak) {
   let scoreTai = 50, scoreXiu = 50;
   const diff = Math.abs(taiPct - xiuPct);
   
-  const recent2 = history.slice(0, 2);
-  if (recent2.length >= 2 && recent2[0].result !== recent2[1].result) {
-    if (recent2[0].result === 'TAI') {
-      scoreXiu += 40;
-    } else {
-      scoreTai += 40;
-    }
-  } else {
+  // 1. BẪY DÒNG TIỀN LỚN (ưu tiên cao nhất khi chênh lệch > 12%)
+  if (diff > 12) {
+    // Đánh ngược lại đám đông với trọng số mạnh
     if (taiPct > xiuPct) {
-      scoreTai += diff * 0.5;
+      scoreXiu += 35;
     } else {
-      scoreXiu += diff * 0.5;
-    }
-  }
-  
-  if (streak.count >= 4) {
-    const bonus = Math.min(streak.count * 2, 10);
-    if (streak.type === 'TAI') scoreXiu += bonus;
-    else scoreTai += bonus;
-  }
-
-  const totalScore = scoreTai + scoreXiu;
-  const taiConf = scoreTai / totalScore * 100;
-  const xiuConf = scoreXiu / totalScore * 100;
-  const pick = taiConf > xiuConf ? 'TAI' : 'XIU';
-  const confidence = Math.max(taiConf, xiuConf);
-  const icon = confidence >= 65 ? '🎯' : confidence >= 55 ? '📈' : '🤔';
-
-  return { icon, text: `${pick} — ${confidence.toFixed(0)}%`, confidence, pick };
-}
-
-// THUẬT TOÁN NÂNG CẤP (đọc vị tâm lý + bắt cầu chính xác hơn)
-function calcSignalEnhanced(taiPct, xiuPct, tick, state, streak) {
-  if (state !== 'BETTING' || tick > 30) {
-    return { icon: '⏳', text: 'Chờ dữ liệu', confidence: 0, pick: null };
-  }
-
-  let scoreTai = 50, scoreXiu = 50;
-  const diff = Math.abs(taiPct - xiuPct);
-  
-  // 1. Xử lý tín hiệu cầu xen kẽ (giảm trọng số từ 40 xuống 25)
-  const recent2 = history.slice(0, 2);
-  if (recent2.length >= 2 && recent2[0].result !== recent2[1].result) {
-    if (recent2[0].result === 'TAI') {
-      scoreXiu += 25;
-    } else {
-      scoreTai += 25;
+      scoreTai += 35;
     }
   } else {
-    // 2. Không xen kẽ -> phân tích dòng tiền
-    if (diff > 10) {
-      // Dòng tiền quá lệch -> khả năng cao là bẫy nhà cái -> đánh ngược
-      if (taiPct > xiuPct) {
+    // 2. XỬ LÝ CẦU XEN KẼ (giảm trọng số còn 20)
+    const recent2 = history.slice(0, 2);
+    if (recent2.length >= 2 && recent2[0].result !== recent2[1].result) {
+      if (recent2[0].result === 'TAI') {
         scoreXiu += 20;
       } else {
         scoreTai += 20;
       }
     } else {
-      // Chênh lệch nhỏ -> theo dòng tiền thật
+      // 3. THEO DÒNG TIỀN KHI CHÊNH LỆCH NHỎ
       if (taiPct > xiuPct) {
-        scoreTai += diff * 0.7; // tăng nhẹ hệ số
+        scoreTai += diff * 0.8; // tăng nhẹ hệ số
       } else {
-        scoreXiu += diff * 0.7;
+        scoreXiu += diff * 0.8;
       }
     }
   }
   
-  // 3. Chuỗi dài: sửa thành THEO CHUỖI thay vì bẻ cầu
+  // 4. CHUỖI DÀI (≥3): theo chuỗi nhưng giảm trọng số khi có bẫy
   if (streak.count >= 3) {
-    const bonus = Math.min(streak.count * 3, 18); // tối đa +18
+    let bonus = Math.min(streak.count * 2, 12); // giảm tối đa còn 12
+    // Nếu đang có bẫy dòng tiền (diff > 12), giảm bonus chuỗi xuống 1/2
+    if (diff > 12) bonus = Math.floor(bonus / 2);
+    
     if (streak.type === 'TAI') {
       scoreTai += bonus;
     } else {
@@ -412,18 +375,22 @@ function calcSignalEnhanced(taiPct, xiuPct, tick, state, streak) {
   const pick = taiConf > xiuConf ? 'TAI' : 'XIU';
   const confidence = Math.max(taiConf, xiuConf);
   
-  // Phân loại độ tin cậy dựa trên mức chênh điểm
+  // KHÔNG DỰ ĐOÁN NẾU CHÊNH LỆCH ĐIỂM QUÁ THẤP (< 5%)
   const pointDiff = Math.abs(scoreTai - scoreXiu);
+  if (pointDiff < 5) {
+    return { icon: '😴', text: 'Tín hiệu yếu — Chờ phiên sau', confidence: 0, pick: null };
+  }
+  
   let icon = '🤔';
-  if (pointDiff >= 20) icon = '🎯';
-  else if (pointDiff >= 10) icon = '📈';
+  if (pointDiff >= 25) icon = '🎯';
+  else if (pointDiff >= 12) icon = '📈';
 
   return { icon, text: `${pick} — ${confidence.toFixed(0)}%`, confidence, pick };
 }
 
 // ---------- API Routes ----------
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', message: 'Tài Xỉu API - Thuật toán nâng cấp' });
+  res.json({ status: 'ok', message: 'Tài Xỉu API - V2 (Trap >12%, smart streak)' });
 });
 
 app.get('/api/snapshot', (req, res) => {
@@ -444,7 +411,7 @@ app.get('/api/dudoan', (req, res) => {
   const taiPct = data.totalAmountPerType.TAI / total * 100;
   const xiuPct = 100 - taiPct;
   const streak = getStreak(history);
-  const signal = calcSignalEnhanced(taiPct, xiuPct, d.subTick, d.state, streak);
+  const signal = calcSignalEnhancedV2(taiPct, xiuPct, d.subTick, d.state, streak);
   
   // Vẫn hỗ trợ gọi API thủ công (không ảnh hưởng tự động)
   if (d.state === 'BETTING' && d.subTick === 10 && signal.pick && (!lastPrediction || lastPrediction.id !== d.id)) {
@@ -467,7 +434,7 @@ app.get('/api/dudoan', (req, res) => {
         confidence: signal.confidence
       };
     }
-    console.log(`[PRED] #${d.id}: Dự đoán ${signal.pick} (${signal.confidence.toFixed(0)}%) (qua API)`);
+    console.log(`[PRED] #${d.id}: Dự đoán ${signal.pick} (${signal.confidence.toFixed(0)}%) (qua API V2)`);
   }
   
   res.json({
@@ -601,7 +568,7 @@ app.get('/api/training-data', (req, res) => {
   });
 });
 
-// API MỚI: Backtest thuật toán mới trên dữ liệu cũ
+// API MỚI: Backtest thuật toán V2 trên dữ liệu cũ
 app.get('/api/backtest', (req, res) => {
   fs.readFile('training_data.jsonl', 'utf8', (err, data) => {
     if (err) {
@@ -613,7 +580,6 @@ app.get('/api/backtest', (req, res) => {
       catch { return null; }
     }).filter(s => s);
     
-    // Sắp xếp theo ID tăng dần để mô phỏng đúng trình tự thời gian
     sessions.sort((a, b) => a.id - b.id);
     
     let correct = 0;
@@ -621,20 +587,16 @@ app.get('/api/backtest', (req, res) => {
     const fakeHistory = [];
     
     sessions.forEach(s => {
-      if (!s.prediction) return; // bỏ qua nếu không có dự đoán
+      if (!s.prediction) return;
       
-      // Mô phỏng streak từ fakeHistory
       const streak = getStreak(fakeHistory);
-      
-      // Gọi thuật toán NÂNG CẤP
-      const signal = calcSignalEnhanced(s.taiPct, s.xiuPct, 10, 'BETTING', streak);
+      const signal = calcSignalEnhancedV2(s.taiPct, s.xiuPct, 10, 'BETTING', streak);
       
       if (signal.pick) {
         const isCorrect = (signal.pick === s.result);
         if (isCorrect) correct++;
         total++;
         
-        // Cập nhật fakeHistory để tính streak cho phiên sau
         fakeHistory.unshift({ result: s.result });
         if (fakeHistory.length > 100) fakeHistory.pop();
       }
@@ -642,7 +604,7 @@ app.get('/api/backtest', (req, res) => {
     
     const accuracy = total > 0 ? (correct / total * 100).toFixed(2) : 0;
     res.json({
-      algorithm: 'Enhanced (trap detection + follow streak)',
+      algorithm: 'V2 (Trap >12%, smart streak)',
       totalSessions: sessions.length,
       backtestedSessions: total,
       correct: correct,
@@ -656,6 +618,6 @@ app.get('/api/backtest', (req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 Server on port ${PORT}`);
   console.log(`👤 User: ${USERNAME}`);
-  console.log(`🧠 Thuật toán: Enhanced (bẫy >10%, theo chuỗi ≥3)`);
+  console.log(`🧠 Thuật toán: V2 - Bẫy >12%, ưu tiên tín hiệu mạnh`);
   connectWS();
 });
