@@ -15,8 +15,8 @@ app.use(express.json());
 let history = [];
 let predHistory = [];
 let currentTick = null;
-let lastPrediction = null;       // Lưu { id, predicted, confidence }
-let lastSnapshot10s = null;      // Lưu snapshot đầy đủ lúc 10 giây
+let lastPrediction = null;
+let lastSnapshot10s = null;
 
 // Auth
 const USERNAME = process.env.TELE68_USER || "dinhhaor150";
@@ -180,7 +180,7 @@ async function connectWS() {
             const taiPct = data.totalAmountPerType.TAI / total * 100;
             const xiuPct = 100 - taiPct;
             const streak = getStreak(history);
-            const signal = calcSignal(taiPct, xiuPct, d.subTick, d.state, streak);
+            const signal = calcSignalEnhanced(taiPct, xiuPct, d.subTick, d.state, streak);
             
             if (signal.pick && (!lastPrediction || lastPrediction.id !== d.id)) {
               lastPrediction = {
@@ -189,7 +189,6 @@ async function connectWS() {
                 confidence: signal.confidence
               };
 
-              // Lưu snapshot đầy đủ vào biến toàn cục (để dùng khi có kết quả)
               lastSnapshot10s = {
                 id: d.id,
                 time: new Date().toISOString(),
@@ -205,7 +204,6 @@ async function connectWS() {
 
               console.log(`[PRED] #${d.id}: Dự đoán ${signal.pick} (${signal.confidence.toFixed(0)}%) tại 10s`);
 
-              // Vẫn lưu riêng snapshots_10s.jsonl (nếu cần)
               fs.appendFile('snapshots_10s.jsonl', JSON.stringify(lastSnapshot10s) + '\n', (err) => {
                 if (err) console.error('[FILE] Lỗi lưu snapshot 10s:', err.message);
                 else console.log(`[SNAPSHOT] Đã lưu dữ liệu 10s cho phiên #${d.id}`);
@@ -223,7 +221,6 @@ async function connectWS() {
         if (history.length > 100) history = history.slice(0, 100);
         console.log(`[RESULT] #${entry.sessionId}: ${entry.result}`);
         
-        // 1. Lưu dữ liệu cuối phiên vào sessions.jsonl
         if (currentTick && currentTick.data) {
           const data = currentTick.data;
           const total = data.totalAmountPerType.TAI + data.totalAmountPerType.XIU;
@@ -256,11 +253,9 @@ async function connectWS() {
           });
         }
 
-        // 2. Xử lý dự đoán đúng/sai và tạo training data
         if (lastPrediction && lastPrediction.id == entry.sessionId && lastSnapshot10s) {
           const correct = lastPrediction.predicted === entry.result;
           
-          // Lưu vào predictions.jsonl (lịch sử đúng/sai)
           const predEntry = {
             id: parseInt(entry.sessionId),
             predicted: lastPrediction.predicted,
@@ -279,11 +274,10 @@ async function connectWS() {
           predHistory.unshift(predEntry);
           if (predHistory.length > 50) predHistory = predHistory.slice(0, 50);
 
-          // 3. TẠO TRAINING DATA: Kết hợp snapshot 10s + kết quả
           const trainingEntry = {
-            ...lastSnapshot10s,               // toàn bộ dữ liệu lúc 10s
-            result: entry.result,             // kết quả thực tế
-            dices: entry.dice,                // xúc xắc
+            ...lastSnapshot10s,
+            result: entry.result,
+            dices: entry.dice,
             sum: entry.dice.reduce((a, b) => a + b, 0),
             correct: correct,
             resultTime: new Date().toISOString()
@@ -296,7 +290,6 @@ async function connectWS() {
 
           console.log(`[PRED] #${entry.sessionId}: ${lastPrediction.predicted} → ${entry.result} ${correct ? '✅' : '❌'}`);
           
-          // Reset sau khi dùng
           lastPrediction = null;
           lastSnapshot10s = null;
         }
@@ -327,6 +320,7 @@ function getStreak(hist) {
   return { count, type: first };
 }
 
+// THUẬT TOÁN CŨ (giữ lại để đối chiếu)
 function calcSignal(taiPct, xiuPct, tick, state, streak) {
   if (state !== 'BETTING' || tick > 30) {
     return { icon: '⏳', text: 'Chờ dữ liệu', confidence: 0, pick: null };
@@ -366,9 +360,70 @@ function calcSignal(taiPct, xiuPct, tick, state, streak) {
   return { icon, text: `${pick} — ${confidence.toFixed(0)}%`, confidence, pick };
 }
 
+// THUẬT TOÁN NÂNG CẤP (đọc vị tâm lý + bắt cầu chính xác hơn)
+function calcSignalEnhanced(taiPct, xiuPct, tick, state, streak) {
+  if (state !== 'BETTING' || tick > 30) {
+    return { icon: '⏳', text: 'Chờ dữ liệu', confidence: 0, pick: null };
+  }
+
+  let scoreTai = 50, scoreXiu = 50;
+  const diff = Math.abs(taiPct - xiuPct);
+  
+  // 1. Xử lý tín hiệu cầu xen kẽ (giảm trọng số từ 40 xuống 25)
+  const recent2 = history.slice(0, 2);
+  if (recent2.length >= 2 && recent2[0].result !== recent2[1].result) {
+    if (recent2[0].result === 'TAI') {
+      scoreXiu += 25;
+    } else {
+      scoreTai += 25;
+    }
+  } else {
+    // 2. Không xen kẽ -> phân tích dòng tiền
+    if (diff > 10) {
+      // Dòng tiền quá lệch -> khả năng cao là bẫy nhà cái -> đánh ngược
+      if (taiPct > xiuPct) {
+        scoreXiu += 20;
+      } else {
+        scoreTai += 20;
+      }
+    } else {
+      // Chênh lệch nhỏ -> theo dòng tiền thật
+      if (taiPct > xiuPct) {
+        scoreTai += diff * 0.7; // tăng nhẹ hệ số
+      } else {
+        scoreXiu += diff * 0.7;
+      }
+    }
+  }
+  
+  // 3. Chuỗi dài: sửa thành THEO CHUỖI thay vì bẻ cầu
+  if (streak.count >= 3) {
+    const bonus = Math.min(streak.count * 3, 18); // tối đa +18
+    if (streak.type === 'TAI') {
+      scoreTai += bonus;
+    } else {
+      scoreXiu += bonus;
+    }
+  }
+
+  const totalScore = scoreTai + scoreXiu;
+  const taiConf = scoreTai / totalScore * 100;
+  const xiuConf = scoreXiu / totalScore * 100;
+  const pick = taiConf > xiuConf ? 'TAI' : 'XIU';
+  const confidence = Math.max(taiConf, xiuConf);
+  
+  // Phân loại độ tin cậy dựa trên mức chênh điểm
+  const pointDiff = Math.abs(scoreTai - scoreXiu);
+  let icon = '🤔';
+  if (pointDiff >= 20) icon = '🎯';
+  else if (pointDiff >= 10) icon = '📈';
+
+  return { icon, text: `${pick} — ${confidence.toFixed(0)}%`, confidence, pick };
+}
+
 // ---------- API Routes ----------
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', message: 'Tài Xỉu API' });
+  res.json({ status: 'ok', message: 'Tài Xỉu API - Thuật toán nâng cấp' });
 });
 
 app.get('/api/snapshot', (req, res) => {
@@ -389,16 +444,15 @@ app.get('/api/dudoan', (req, res) => {
   const taiPct = data.totalAmountPerType.TAI / total * 100;
   const xiuPct = 100 - taiPct;
   const streak = getStreak(history);
-  const signal = calcSignal(taiPct, xiuPct, d.subTick, d.state, streak);
+  const signal = calcSignalEnhanced(taiPct, xiuPct, d.subTick, d.state, streak);
   
-  // Hỗ trợ gọi API thủ công (không ảnh hưởng tự động)
+  // Vẫn hỗ trợ gọi API thủ công (không ảnh hưởng tự động)
   if (d.state === 'BETTING' && d.subTick === 10 && signal.pick && (!lastPrediction || lastPrediction.id !== d.id)) {
     lastPrediction = {
       id: d.id,
       predicted: signal.pick,
       confidence: signal.confidence
     };
-    // Cập nhật snapshot nếu chưa có
     if (!lastSnapshot10s) {
       lastSnapshot10s = {
         id: d.id,
@@ -444,7 +498,6 @@ app.post('/api/dulieu', (req, res) => {
   res.json({ success: true });
 });
 
-// API lấy dữ liệu sessions cuối phiên
 app.get('/api/sessions', (req, res) => {
   fs.readFile('sessions.jsonl', 'utf8', (err, data) => {
     if (err) {
@@ -469,7 +522,6 @@ app.delete('/api/sessions', (req, res) => {
   });
 });
 
-// API lấy lịch sử đúng/sai (predictions)
 app.get('/api/dungsai', (req, res) => {
   const limit = parseInt(req.query.limit) || null;
   const offset = parseInt(req.query.offset) || 0;
@@ -508,7 +560,6 @@ app.delete('/api/dungsai', (req, res) => {
   });
 });
 
-// API lấy snapshot 10s (cũ)
 app.get('/api/snapshots10s', (req, res) => {
   fs.readFile('snapshots_10s.jsonl', 'utf8', (err, data) => {
     if (err) {
@@ -523,7 +574,6 @@ app.get('/api/snapshots10s', (req, res) => {
   });
 });
 
-// API QUAN TRỌNG NHẤT: Lấy dữ liệu huấn luyện (có cả features lúc 10s và kết quả)
 app.get('/api/training-data', (req, res) => {
   const limit = parseInt(req.query.limit) || null;
   const offset = parseInt(req.query.offset) || 0;
@@ -538,7 +588,6 @@ app.get('/api/training-data', (req, res) => {
       catch { return null; }
     }).filter(t => t);
     
-    // Sắp xếp mới nhất trước
     training.sort((a, b) => b.id - a.id);
     
     const total = training.length;
@@ -552,9 +601,61 @@ app.get('/api/training-data', (req, res) => {
   });
 });
 
+// API MỚI: Backtest thuật toán mới trên dữ liệu cũ
+app.get('/api/backtest', (req, res) => {
+  fs.readFile('training_data.jsonl', 'utf8', (err, data) => {
+    if (err) {
+      return res.json({ error: 'Chưa có dữ liệu để backtest' });
+    }
+    const lines = data.trim().split('\n').filter(l => l);
+    const sessions = lines.map(l => {
+      try { return JSON.parse(l); }
+      catch { return null; }
+    }).filter(s => s);
+    
+    // Sắp xếp theo ID tăng dần để mô phỏng đúng trình tự thời gian
+    sessions.sort((a, b) => a.id - b.id);
+    
+    let correct = 0;
+    let total = 0;
+    const fakeHistory = [];
+    
+    sessions.forEach(s => {
+      if (!s.prediction) return; // bỏ qua nếu không có dự đoán
+      
+      // Mô phỏng streak từ fakeHistory
+      const streak = getStreak(fakeHistory);
+      
+      // Gọi thuật toán NÂNG CẤP
+      const signal = calcSignalEnhanced(s.taiPct, s.xiuPct, 10, 'BETTING', streak);
+      
+      if (signal.pick) {
+        const isCorrect = (signal.pick === s.result);
+        if (isCorrect) correct++;
+        total++;
+        
+        // Cập nhật fakeHistory để tính streak cho phiên sau
+        fakeHistory.unshift({ result: s.result });
+        if (fakeHistory.length > 100) fakeHistory.pop();
+      }
+    });
+    
+    const accuracy = total > 0 ? (correct / total * 100).toFixed(2) : 0;
+    res.json({
+      algorithm: 'Enhanced (trap detection + follow streak)',
+      totalSessions: sessions.length,
+      backtestedSessions: total,
+      correct: correct,
+      wrong: total - correct,
+      accuracy: parseFloat(accuracy)
+    });
+  });
+});
+
 // Start
 app.listen(PORT, () => {
   console.log(`🚀 Server on port ${PORT}`);
   console.log(`👤 User: ${USERNAME}`);
+  console.log(`🧠 Thuật toán: Enhanced (bẫy >10%, theo chuỗi ≥3)`);
   connectWS();
 });
