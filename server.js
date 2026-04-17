@@ -18,10 +18,10 @@ let currentTick = null;
 let lastPrediction = null;
 let lastSnapshot10s = null;
 
-// Biến theo dõi trạng thái
-let consecutiveWrong = 0;        // Số lần sai liên tiếp
-let followStreakMode = false;    // Chế độ "theo chuỗi" khi thua nhiều
-let lastResult = null;           // Kết quả phiên gần nhất
+// Biến trạng thái
+let consecutiveWrong = 0;
+let followStreakMode = false;
+let lastResult = null;
 
 // Auth
 const USERNAME = process.env.TELE68_USER || "dinhhaor150";
@@ -185,7 +185,7 @@ async function connectWS() {
             const taiPct = data.totalAmountPerType.TAI / total * 100;
             const xiuPct = 100 - taiPct;
             const streak = getStreak(history);
-            const signal = calcSignalV4(taiPct, xiuPct, d.subTick, d.state, streak);
+            const signal = calcSignalV5(taiPct, xiuPct, d.subTick, d.state, streak, total);
             
             if (signal.pick && (!lastPrediction || lastPrediction.id !== d.id)) {
               lastPrediction = {
@@ -207,7 +207,7 @@ async function connectWS() {
                 confidence: signal.confidence
               };
 
-              console.log(`[PRED] #${d.id}: Dự đoán ${signal.pick} (${signal.confidence.toFixed(0)}%) [V4] - Mode: ${followStreakMode ? 'THEO CHUỖI' : 'THƯỜNG'}, Sai liên tiếp: ${consecutiveWrong}`);
+              console.log(`[PRED] #${d.id}: Dự đoán ${signal.pick} (${signal.confidence.toFixed(0)}%) [V5] - Sai LT: ${consecutiveWrong}`);
 
               fs.appendFile('snapshots_10s.jsonl', JSON.stringify(lastSnapshot10s) + '\n', (err) => {
                 if (err) console.error('[FILE] Lỗi lưu snapshot 10s:', err.message);
@@ -226,7 +226,6 @@ async function connectWS() {
         if (history.length > 100) history = history.slice(0, 100);
         console.log(`[RESULT] #${entry.sessionId}: ${entry.result}`);
         
-        // Cập nhật kết quả gần nhất
         lastResult = entry.result;
         
         if (currentTick && currentTick.data) {
@@ -264,21 +263,16 @@ async function connectWS() {
         if (lastPrediction && lastPrediction.id == entry.sessionId && lastSnapshot10s) {
           const correct = lastPrediction.predicted === entry.result;
           
-          // Cập nhật chuỗi thua và chế độ
           if (correct) {
             consecutiveWrong = 0;
-            // Nếu chuỗi kết quả gãy, tắt chế độ theo chuỗi
             const streak = getStreak(history);
-            if (streak.count < 3) {
-              followStreakMode = false;
-            }
+            if (streak.count < 3) followStreakMode = false;
           } else {
             consecutiveWrong++;
-            // Kích hoạt chế độ theo chuỗi nếu thua 2 lần liên tiếp và đang có chuỗi ≥ 3
             const streak = getStreak(history);
             if (consecutiveWrong >= 2 && streak.count >= 3) {
               followStreakMode = true;
-              console.log(`[MODE] Kích hoạt chế độ THEO CHUỖI do thua ${consecutiveWrong} lần và chuỗi ${streak.count} ${streak.type}`);
+              console.log(`[MODE] Kích hoạt THEO CHUỖI (thua ${consecutiveWrong}, chuỗi ${streak.count} ${streak.type})`);
             }
           }
           
@@ -346,8 +340,8 @@ function getStreak(hist) {
   return { count, type: first };
 }
 
-// THUẬT TOÁN V4 - Chống chuỗi thua dài, bắt cầu bệt
-function calcSignalV4(taiPct, xiuPct, tick, state, streak) {
+// THUẬT TOÁN V5 – Chống chuỗi thua, lọc tín hiệu yếu, bẫy thông minh hơn
+function calcSignalV5(taiPct, xiuPct, tick, state, streak, totalAmt) {
   if (state !== 'BETTING' || tick > 30) {
     return { icon: '⏳', text: 'Chờ dữ liệu', confidence: 0, pick: null };
   }
@@ -355,57 +349,45 @@ function calcSignalV4(taiPct, xiuPct, tick, state, streak) {
   let scoreTai = 50, scoreXiu = 50;
   const diff = Math.abs(taiPct - xiuPct);
   
-  // === CHẾ ĐỘ THEO CHUỖI (kích hoạt khi thua nhiều và có cầu bệt) ===
-  if (followStreakMode && streak.count >= 3) {
-    // Ưu tiên tuyệt đối theo chuỗi
-    if (streak.type === 'TAI') {
-      scoreTai += 30;
-    } else {
-      scoreXiu += 30;
-    }
-    // Vẫn xem xét dòng tiền nhưng trọng số nhỏ
+  // Điều chỉnh ngưỡng bẫy dựa trên chuỗi thua và tổng tiền
+  let trapThreshold = 18;
+  if (consecutiveWrong >= 2) trapThreshold = 22;
+  if (totalAmt < 150000000) trapThreshold += 3; // Nếu tiền ít, tăng ngưỡng
+  
+  // 1. BẪY DÒNG TIỀN (chỉ khi vượt ngưỡng và tổng tiền đủ lớn)
+  if (diff > trapThreshold && totalAmt > 120000000) {
     if (taiPct > xiuPct) {
-      scoreTai += 5;
+      scoreXiu += 24;
     } else {
-      scoreXiu += 5;
+      scoreTai += 24;
     }
   } else {
-    // === CHẾ ĐỘ THƯỜNG (có điều chỉnh để tránh thua liên tiếp) ===
-    
-    // 1. Bẫy dòng tiền lớn (chênh > 15%)
-    if (diff > 15) {
-      if (taiPct > xiuPct) {
-        scoreXiu += 22;
+    // 2. XỬ LÝ CẦU XEN KẼ (trọng số 18)
+    const recent2 = history.slice(0, 2);
+    if (recent2.length >= 2 && recent2[0].result !== recent2[1].result) {
+      if (recent2[0].result === 'TAI') {
+        scoreXiu += 18;
       } else {
-        scoreTai += 22;
+        scoreTai += 18;
       }
     } else {
-      // 2. Xử lý cầu xen kẽ
-      const recent2 = history.slice(0, 2);
-      if (recent2.length >= 2 && recent2[0].result !== recent2[1].result) {
-        if (recent2[0].result === 'TAI') {
-          scoreXiu += 20;
-        } else {
-          scoreTai += 20;
-        }
+      // 3. THEO DÒNG TIỀN (chênh lệch nhỏ)
+      if (taiPct > xiuPct) {
+        scoreTai += diff * 0.6;
       } else {
-        // 3. Theo dòng tiền
-        if (taiPct > xiuPct) {
-          scoreTai += diff * 0.6;
-        } else {
-          scoreXiu += diff * 0.6;
-        }
+        scoreXiu += diff * 0.6;
       }
     }
-    
-    // 4. Chuỗi dài (≥4) -> theo chuỗi nhưng trọng số vừa phải
-    if (streak.count >= 4) {
-      const bonus = Math.min(streak.count * 2, 12);
-      if (streak.type === 'TAI') {
-        scoreTai += bonus;
-      } else {
-        scoreXiu += bonus;
-      }
+  }
+  
+  // 4. CHUỖI DÀI (>=3): ưu tiên theo chuỗi
+  if (streak.count >= 3) {
+    let bonus = Math.min(streak.count * 2, 14);
+    if (consecutiveWrong >= 2) bonus = Math.floor(bonus * 0.6);
+    if (streak.type === 'TAI') {
+      scoreTai += bonus;
+    } else {
+      scoreXiu += bonus;
     }
   }
 
@@ -415,9 +397,9 @@ function calcSignalV4(taiPct, xiuPct, tick, state, streak) {
   const pick = taiConf > xiuConf ? 'TAI' : 'XIU';
   const confidence = Math.max(taiConf, xiuConf);
   
-  // Ngưỡng lọc tín hiệu yếu
   const pointDiff = Math.abs(scoreTai - scoreXiu);
-  if (pointDiff < 6) {
+  // Tăng ngưỡng lọc tín hiệu yếu
+  if (pointDiff < 8) {
     return { icon: '😴', text: 'Tín hiệu yếu — Bỏ qua', confidence: 0, pick: null };
   }
   
@@ -430,7 +412,7 @@ function calcSignalV4(taiPct, xiuPct, tick, state, streak) {
 
 // ---------- API Routes ----------
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', message: 'Tài Xỉu API - V4 (Anti-long-losing-streak)' });
+  res.json({ status: 'ok', message: 'Tài Xỉu API - V5 (Advanced Anti-Trap)' });
 });
 
 app.get('/api/snapshot', (req, res) => {
@@ -451,7 +433,7 @@ app.get('/api/dudoan', (req, res) => {
   const taiPct = data.totalAmountPerType.TAI / total * 100;
   const xiuPct = 100 - taiPct;
   const streak = getStreak(history);
-  const signal = calcSignalV4(taiPct, xiuPct, d.subTick, d.state, streak);
+  const signal = calcSignalV5(taiPct, xiuPct, d.subTick, d.state, streak, total);
   
   if (d.state === 'BETTING' && d.subTick === 10 && signal.pick && (!lastPrediction || lastPrediction.id !== d.id)) {
     lastPrediction = {
@@ -473,7 +455,7 @@ app.get('/api/dudoan', (req, res) => {
         confidence: signal.confidence
       };
     }
-    console.log(`[PRED] #${d.id}: Dự đoán ${signal.pick} (${signal.confidence.toFixed(0)}%) (qua API V4)`);
+    console.log(`[PRED] #${d.id}: Dự đoán ${signal.pick} (${signal.confidence.toFixed(0)}%) (qua API V5)`);
   }
   
   res.json({
@@ -611,6 +593,6 @@ app.get('/api/training-data', (req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 Server on port ${PORT}`);
   console.log(`👤 User: ${USERNAME}`);
-  console.log(`🧠 Thuật toán: V4 - Tự động ngắt chuỗi thua, bắt cầu bệt`);
+  console.log(`🧠 Thuật toán: V5 – Bẫy thông minh, chống chuỗi thua`);
   connectWS();
 });
